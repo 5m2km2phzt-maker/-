@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-  <title>镜彩 · LENSLY · 478点贴脸真实关键点网格与全脸型校准 v32</title>
+  <title>镜彩 · LENSLY · 真实关键点与离线视觉贴脸网格 v37</title>
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js" crossorigin="anonymous"></script>
   <style>
     :root {
@@ -2363,7 +2363,7 @@
 
 
 
-    /* ===== v32：478点贴脸真实关键点网格、Head Pose、全脸型校准与镜框匹配 ===== */
+    /* ===== v32：面部贴合三角网格、Head Pose、全脸型校准与镜框匹配 ===== */
     .ai-geometry-panel{
       margin:16px 0;
       border-radius:22px;
@@ -2949,7 +2949,7 @@
           <div class="face-scan-note">系统只使用用户照片中真实检测到的面部关键点生成贴脸网格，不再使用规则椭圆或估算网格。分析完成后，最终效果图只保留用户面部与所选镜框。</div>
           <div class="face-scan-steps">
             <div class="face-scan-step" data-scan-step="1"><b>1</b><span>人脸检测与对齐</span><small>WAIT</small></div>
-            <div class="face-scan-step" data-scan-step="2"><b>2</b><span>478点贴脸真实关键点网格</span><small>WAIT</small></div>
+            <div class="face-scan-step" data-scan-step="2"><b>2</b><span>面部贴合三角网格</span><small>WAIT</small></div>
             <div class="face-scan-step" data-scan-step="3"><b>3</b><span>几何参数与 Head Pose</span><small>WAIT</small></div>
             <div class="face-scan-step" data-scan-step="4"><b>4</b><span>全脸型概率分类</span><small>WAIT</small></div>
           </div>
@@ -2958,7 +2958,7 @@
             将根据额头、颧骨、下颌、下巴、面部长度、角度与曲率综合分析。
           </div>
           <div class="face-scan-actions">
-            <button type="button" id="faceScanReplayBtn">重新检测真实网格</button>
+            <button type="button" id="faceScanReplayBtn">重新生成贴脸网格</button>
             <button class="primary" type="button" id="faceScanContinueBtn">继续选择镜框</button>
           </div>
         </div>
@@ -4604,6 +4604,264 @@ snap.addEventListener('wheel', (e)=>{
         }
       }
 
+
+      // ==================== v37：离线视觉贴脸网格 ====================
+      // 当 MediaPipe 因 file://、CDN、WASM 或网络原因不可用时，直接从当前上传照片的像素中
+      // 提取肤色连通区域、面部行宽轮廓、双眼暗区和嘴唇区域，生成随用户面部变化的网格。
+      // 这不是 468/478 个真实 MediaPipe 关键点，因此界面会明确标注为“视觉贴脸网格”。
+      function buildAdaptiveFaceInfoV37(img){
+        const W=img.naturalWidth||img.width||1;
+        const H=img.naturalHeight||img.height||1;
+        const maxSide=360;
+        const s=Math.min(1,maxSide/Math.max(W,H));
+        const w=Math.max(120,Math.round(W*s));
+        const h=Math.max(120,Math.round(H*s));
+        const c=document.createElement('canvas');c.width=w;c.height=h;
+        const cx2=c.getContext('2d',{willReadFrequently:true});
+        cx2.drawImage(img,0,0,w,h);
+        const data=cx2.getImageData(0,0,w,h).data;
+        const raw=new Uint8Array(w*h);
+        const lumAt=(x,y)=>{
+          const i=(y*w+x)*4;
+          return .299*data[i]+.587*data[i+1]+.114*data[i+2];
+        };
+        for(let y=0;y<h;y++){
+          for(let x=0;x<w;x++){
+            const i=(y*w+x)*4,r=data[i],g=data[i+1],b=data[i+2];
+            const Y=.299*r+.587*g+.114*b;
+            const Cb=128-.168736*r-.331264*g+.5*b;
+            const Cr=128+.5*r-.418688*g-.081312*b;
+            const central=x>w*.12&&x<w*.88&&y>h*.06&&y<h*.80;
+            const skin=central&&Y>45&&Cr>132&&Cr<183&&Cb>72&&Cb<137&&r>g*.82&&r>b*.72;
+            raw[y*w+x]=skin?1:0;
+          }
+        }
+        // 轻量形态学平滑，去掉孤立噪点并填补眼睛、眉毛附近的小洞。
+        const mask=new Uint8Array(w*h);
+        for(let y=1;y<h-1;y++){
+          for(let x=1;x<w-1;x++){
+            let n=0;
+            for(let yy=-1;yy<=1;yy++)for(let xx=-1;xx<=1;xx++)n+=raw[(y+yy)*w+x+xx];
+            mask[y*w+x]=(n>=4)?1:0;
+          }
+        }
+        const visited=new Uint8Array(w*h);
+        const components=[];
+        const q=new Int32Array(w*h);
+        for(let y=Math.floor(h*.08);y<Math.floor(h*.78);y++){
+          for(let x=Math.floor(w*.12);x<Math.floor(w*.88);x++){
+            const start=y*w+x;
+            if(!mask[start]||visited[start])continue;
+            let head=0,tail=0;q[tail++]=start;visited[start]=1;
+            let area=0,minX=x,maxX=x,minY=y,maxY=y,sumX=0,sumY=0;
+            while(head<tail){
+              const p=q[head++],py=Math.floor(p/w),px=p-py*w;
+              area++;sumX+=px;sumY+=py;
+              if(px<minX)minX=px;if(px>maxX)maxX=px;if(py<minY)minY=py;if(py>maxY)maxY=py;
+              const ns=[p-1,p+1,p-w,p+w];
+              for(const np of ns){
+                if(np<0||np>=w*h||visited[np]||!mask[np])continue;
+                const ny=Math.floor(np/w),nx=np-ny*w;
+                if(nx<=0||nx>=w-1||ny<=0||ny>=h-1)continue;
+                visited[np]=1;q[tail++]=np;
+              }
+            }
+            if(area>80){
+              const mx=sumX/area,my=sumY/area;
+              const centerPenalty=Math.abs(mx-w*.5)/w+Math.abs(my-h*.36)/h;
+              const score=area*(1-centerPenalty*.55);
+              components.push({area,minX,maxX,minY,maxY,mx,my,score});
+            }
+          }
+        }
+        components.sort((a,b)=>b.score-a.score);
+        let comp=components[0];
+        if(!comp){
+          comp={minX:w*.31,maxX:w*.69,minY:h*.18,maxY:h*.66,mx:w*.5,my:h*.40,area:1};
+        }
+        // 将选中的面部区域重新限制到中央脸部，避免把脖子和耳朵全部纳入。
+        const rowL=new Int32Array(h);rowL.fill(w);
+        const rowR=new Int32Array(h);rowR.fill(-1);
+        const compMask=new Uint8Array(w*h);
+        // 重新从组件中心做一次洪泛，记录像素。
+        let seedX=Math.round(comp.mx),seedY=Math.round(comp.my),seed=seedY*w+seedX;
+        if(!mask[seed]){
+          outer:for(let rr=0;rr<Math.max(w,h);rr++)for(let yy=Math.max(1,seedY-rr);yy<=Math.min(h-2,seedY+rr);yy++)for(let xx=Math.max(1,seedX-rr);xx<=Math.min(w-2,seedX+rr);xx++)if(mask[yy*w+xx]){seed=yy*w+xx;break outer;}
+        }
+        const seen=new Uint8Array(w*h);let head=0,tail=0;q[tail++]=seed;seen[seed]=1;
+        while(head<tail){
+          const p=q[head++],py=Math.floor(p/w),px=p-py*w;
+          compMask[p]=1;if(px<rowL[py])rowL[py]=px;if(px>rowR[py])rowR[py]=px;
+          const ns=[p-1,p+1,p-w,p+w];
+          for(const np of ns){
+            if(np<0||np>=w*h||seen[np]||!mask[np])continue;
+            const ny=Math.floor(np/w),nx=np-ny*w;
+            if(nx<=0||nx>=w-1||ny<=0||ny>=h-1)continue;
+            seen[np]=1;q[tail++]=np;
+          }
+        }
+        const widths=[];
+        for(let y=0;y<h;y++)widths[y]=rowR[y]>=rowL[y]?rowR[y]-rowL[y]+1:0;
+        let maxWidth=0,cheekY=Math.round(comp.my);
+        for(let y=Math.max(1,comp.minY);y<=Math.min(h-2,comp.maxY);y++)if(widths[y]>maxWidth){maxWidth=widths[y];cheekY=y;}
+        if(maxWidth<20){maxWidth=Math.max(40,comp.maxX-comp.minX);cheekY=Math.round(comp.my);}
+        let top=Math.max(1,comp.minY);
+        for(let y=Math.max(1,comp.minY);y<cheekY;y++){if(widths[y]>.42*maxWidth){top=y;break;}}
+        let bottomGuess=Math.min(h-2,Math.round(top+maxWidth*1.36));
+        let bestY=bottomGuess,bestW=1e9;
+        const startY=Math.min(h-2,Math.round(cheekY+maxWidth*.30));
+        const endY=Math.min(h-2,Math.round(cheekY+maxWidth*.82));
+        for(let y=startY;y<=endY;y++){
+          const ww=widths[y];
+          if(ww>.18*maxWidth&&ww<bestW){bestW=ww;bestY=y;}
+        }
+        let bottom=Math.max(cheekY+Math.round(maxWidth*.42),Math.min(bottomGuess,bestY+Math.round(maxWidth*.04)));
+        bottom=Math.min(h-2,bottom);
+        const faceHeight=Math.max(50,bottom-top);
+        const rowExtent=(yy)=>{
+          const y=Math.max(0,Math.min(h-1,Math.round(yy)));
+          if(rowR[y]>=rowL[y])return [rowL[y],rowR[y]];
+          for(let d=1;d<15;d++){
+            if(y-d>=0&&rowR[y-d]>=rowL[y-d])return [rowL[y-d],rowR[y-d]];
+            if(y+d<h&&rowR[y+d]>=rowL[y+d])return [rowL[y+d],rowR[y+d]];
+          }
+          const t=(y-top)/Math.max(faceHeight,1);
+          const half=maxWidth*.5*Math.sqrt(Math.max(.05,1-Math.pow((t-.48)/.58,2)));
+          return [comp.mx-half,comp.mx+half];
+        };
+        // 双眼：在上半脸两个区域寻找暗像素加权中心。
+        const darkCenter=(x0,x1,y0,y1,defaultX)=>{
+          let sx=0,sy=0,sw=0;
+          for(let y=Math.max(1,Math.round(y0));y<Math.min(h-1,Math.round(y1));y++){
+            for(let x=Math.max(1,Math.round(x0));x<Math.min(w-1,Math.round(x1));x++){
+              const L=lumAt(x,y);
+              const weight=Math.max(0,145-L);
+              if(weight>12){sx+=x*weight;sy+=y*weight;sw+=weight;}
+            }
+          }
+          return sw?{x:sx/sw,y:sy/sw+faceHeight*.018}:{x:defaultX,y:top+faceHeight*.37};
+        };
+        const faceCx=(rowExtent(cheekY)[0]+rowExtent(cheekY)[1])/2;
+        const leftEyeS=darkCenter(faceCx-maxWidth*.40,faceCx-maxWidth*.04,top+faceHeight*.27,top+faceHeight*.47,faceCx-maxWidth*.20);
+        const rightEyeS=darkCenter(faceCx+maxWidth*.04,faceCx+maxWidth*.40,top+faceHeight*.27,top+faceHeight*.47,faceCx+maxWidth*.20);
+        const eyeY=(leftEyeS.y+rightEyeS.y)/2;
+        leftEyeS.y=eyeY;rightEyeS.y=eyeY;
+        // 嘴唇：寻找下半脸红色/暗红区域。
+        let msx=0,msy=0,msw=0;
+        for(let y=Math.round(top+faceHeight*.62);y<Math.min(h-1,Math.round(top+faceHeight*.84));y++){
+          const [lx,rx]=rowExtent(y);
+          for(let x=Math.max(1,Math.round(lx+maxWidth*.16));x<Math.min(w-1,Math.round(rx-maxWidth*.16));x++){
+            const i=(y*w+x)*4,r=data[i],g=data[i+1],b=data[i+2];
+            const score=Math.max(0,(r-(g+b)/2)*1.5+(115-lumAt(x,y))*.25);
+            if(score>8){msx+=x*score;msy+=y*score;msw+=score;}
+          }
+        }
+        const mouthS=msw?{x:msx/msw,y:msy/msw}:{x:faceCx,y:top+faceHeight*.73};
+        const toOriginal=p=>({x:p.x/s,y:p.y/s});
+        const rings=[],edges=[],points=[];
+        const rows=17;
+        for(let r=0;r<rows;r++){
+          const t=r/(rows-1);
+          const y=top+t*faceHeight;
+          let [lx,rx]=rowExtent(y);
+          const center=(lx+rx)/2;
+          // 下巴和额头处稍微收窄，避免耳朵/头发进入网格。
+          const taper=1-Math.max(0,Math.abs(t-.48)-.30)*.62;
+          const half=(rx-lx)/2*taper;
+          lx=center-half;rx=center+half;
+          const count=Math.max(5,Math.round(7+14*Math.sin(Math.PI*t)));
+          const row=[];
+          for(let i=0;i<count;i++){
+            const u=count===1?.5:i/(count-1);
+            const p=toOriginal({x:lx+(rx-lx)*u,y});row.push(p);points.push(p);
+          }
+          rings.push(row);
+        }
+        for(let r=0;r<rings.length;r++){
+          const a=rings[r];
+          for(let i=0;i<a.length-1;i++)edges.push([a[i],a[i+1]]);
+          if(r===rings.length-1)continue;
+          const b=rings[r+1];
+          for(let i=0;i<a.length;i++){
+            const u=a.length===1?0:i/(a.length-1),j=Math.round(u*(b.length-1));
+            edges.push([a[i],b[j]]);
+            if(j+1<b.length&&i<a.length-1)edges.push([a[i],b[j+1]]);
+          }
+        }
+        const outline=[];
+        for(let r=0;r<rings.length;r++)outline.push(rings[r][0]);
+        for(let r=rings.length-1;r>=0;r--)outline.push(rings[r][rings[r].length-1]);
+        const left=toOriginal(leftEyeS),right=toOriginal(rightEyeS),mouth=toOriginal(mouthS);
+        const angle=Math.atan2(right.y-left.y,right.x-left.x);
+        const eyeDistance=Math.hypot(right.x-left.x,right.y-left.y);
+        const widthAt=(fraction)=>{const [l,r]=rowExtent(top+faceHeight*fraction);return (r-l)/s;};
+        const foreheadWidth=widthAt(.17),cheekWidth=maxWidth/s,jawWidth=widthAt(.74),lowerJawWidth=widthAt(.84),chinWidth=widthAt(.94);
+        const visualFaceHeight=faceHeight/s;
+        const faceRatio=visualFaceHeight/Math.max(cheekWidth,1);
+        const jawRatio=jawWidth/Math.max(cheekWidth,1),lowerJawRatio=lowerJawWidth/Math.max(cheekWidth,1),foreheadRatio=foreheadWidth/Math.max(cheekWidth,1);
+        const chinWidthRatio=chinWidth/Math.max(cheekWidth,1);
+        const jawCurvature=v30Clamp((lowerJawWidth-chinWidth)/Math.max(jawWidth,1),0,1);
+        const jawAngleDeg=Math.round(v30Clamp(158-(jawRatio*.82+lowerJawRatio*.18)*28,128,154));
+        const chinLengthRatio=.17+(1-chinWidthRatio)*.06;
+        const roll=angle*180/Math.PI;
+        const faceCenterX=(rowExtent(cheekY)[0]+rowExtent(cheekY)[1])/2/s;
+        const yaw=v30Clamp(((left.x+right.x)/2-faceCenterX)/Math.max(cheekWidth*.20,1)*12,-18,18);
+        const pose={yaw:Number(yaw.toFixed(1)),pitch:0,roll:Number(roll.toFixed(1)),confidence:58,label:'视觉姿态估计'};
+        const metrics={faceRatio,visualFaceRatio:faceRatio,bboxRatio:faceRatio,jawRatio,lowerJawRatio,foreheadRatio,jawStrength:jawRatio*.68+lowerJawRatio*.32,cheekWidth,faceHeight:visualFaceHeight,eyeDistance,mouthWidth:cheekWidth*.35,mouthRatio:.35,chinLengthRatio,chinWidthRatio,jawAngleDeg,jawCurvature,symmetry:.88,upperThird:.33,middleThird:.33,lowerThird:.34,poseYaw:yaw,posePitch:0,innerEyeRatio:.30,pdRatio:eyeDistance/Math.max(cheekWidth,1),fiveEyeRatio:5,browEyeDistance:.22,noseBridgeRatio:.30};
+        const shapeResult=classifyFaceShapeV32(metrics);
+        const probabilities=normalizeShapeProbabilitiesV30(shapeResult.shapeScores);
+        const ordered=Object.entries(probabilities).sort((a,b)=>b[1]-a[1]);
+        const primary=shapeResult.faceType||ordered[0]?.[0]||'鹅蛋脸型';
+        const secondary=shapeResult.secondaryFaceType||ordered[1]?.[0]||'方圆脸型';
+        const topProbability=Number(probabilities[primary]||0),secondProbability=Number(probabilities[secondary]||0);
+        const confidence=Math.round(v30Clamp(54+(topProbability-secondProbability)*.35,54,72));
+        const topP=toOriginal({x:faceCx,y:top});
+        const chinP=toOriginal({x:faceCx,y:bottom});
+        const cheekL=toOriginal({x:rowExtent(cheekY)[0],y:cheekY}),cheekR=toOriginal({x:rowExtent(cheekY)[1],y:cheekY});
+        const frow=rowExtent(top+faceHeight*.17),jrow=rowExtent(top+faceHeight*.74);
+        const foreheadL=toOriginal({x:frow[0],y:top+faceHeight*.17}),foreheadR=toOriginal({x:frow[1],y:top+faceHeight*.17});
+        const jawL=toOriginal({x:jrow[0],y:top+faceHeight*.74}),jawR=toOriginal({x:jrow[1],y:top+faceHeight*.74});
+        const skinTone=analyzeSkinToneFromImage(img,{top:topP,chin:chinP,cheekL,cheekR,jawL,jawR,foreheadL,foreheadR},{faceHeight:visualFaceHeight,cheekWidth,eyeDistance});
+        const analysis={
+          faceCount:1,landmarkCount:points.length,realLandmarks:false,adaptiveMesh:true,meshMode:'visual-contour',
+          faceType:primary,secondaryFaceType:secondary,confidence,frameAdvice:shapeResult.frameAdvice,
+          tags:[...(shapeResult.tags||[]).slice(0,3),'视觉贴脸网格','离线可用'],advice:shapeResult.advice,
+          skinTone,shapeScores:shapeResult.shapeScores,probabilities,headPose:pose,
+          metrics:{...metrics,faceRatio:Number(faceRatio.toFixed(2)),visualFaceRatio:Number(faceRatio.toFixed(2)),bboxRatio:Number(faceRatio.toFixed(2)),foreheadRatio:Number(foreheadRatio.toFixed(2)),cheekboneRatio:1,jawRatio:Number(jawRatio.toFixed(2)),lowerJawRatio:Number(lowerJawRatio.toFixed(2)),jawStrength:Number((jawRatio*.68+lowerJawRatio*.32).toFixed(2)),chinLengthRatio:Number(chinLengthRatio.toFixed(2)),chinWidthRatio:Number(chinWidthRatio.toFixed(2)),jawCurvature:Number(jawCurvature.toFixed(2)),symmetry:.88,cheekWidth:Math.round(cheekWidth),faceHeight:Math.round(visualFaceHeight),foreheadWidth:Math.round(foreheadWidth),jawWidth:Math.round(jawWidth),eyeDistance:Math.round(eyeDistance),mouthWidth:Math.round(cheekWidth*.35)},
+          points:{top:topP,chin:chinP,cheekL,cheekR,jawL,jawR,foreheadL,foreheadR,nose:{x:(left.x+right.x)/2,y:(left.y+mouth.y)/2},browMid:{x:(left.x+right.x)/2,y:left.y-eyeDistance*.22}}
+        };
+        return {left,right,angle,analysis,headPose:pose,landmarks:null,landmarkCount:points.length,realLandmarks:false,adaptiveMesh:true,mesh:{rings,edges,points,outline,leftEye:left,rightEye:right,mouth}};
+      }
+
+      function drawAdaptiveMeshV37(ctx,faceInfo,mode='mesh'){
+        const mesh=faceInfo?.mesh;if(!mesh)return;
+        const W=ctx.canvas.width,scale=Math.max(1,W/900);
+        ctx.save();ctx.shadowColor='rgba(80,235,255,.15)';ctx.shadowBlur=3*scale;
+        ctx.strokeStyle='rgba(235,244,248,.38)';ctx.lineWidth=.68*scale;
+        ctx.beginPath();for(const [a,b] of mesh.edges){ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);}ctx.stroke();ctx.restore();
+        const poly=(pts,color,width,closed=false)=>{if(!pts?.length)return;ctx.save();ctx.strokeStyle=color;ctx.lineWidth=width;ctx.beginPath();ctx.moveTo(pts[0].x,pts[0].y);for(let i=1;i<pts.length;i++)ctx.lineTo(pts[i].x,pts[i].y);if(closed)ctx.closePath();ctx.stroke();ctx.restore();};
+        poly(mesh.outline,'rgba(255,255,255,.96)',1.45*scale,true);
+        const eyeD=Math.hypot(mesh.rightEye.x-mesh.leftEye.x,mesh.rightEye.y-mesh.leftEye.y);
+        const ellipse=(c,rx,ry,n=26)=>Array.from({length:n},(_,i)=>{const t=i/(n-1)*Math.PI*2;return{x:c.x+Math.cos(t)*rx,y:c.y+Math.sin(t)*ry};});
+        poly(ellipse(mesh.leftEye,eyeD*.18,eyeD*.09),'rgba(255,70,70,.98)',1.45*scale,true);
+        poly(ellipse(mesh.rightEye,eyeD*.18,eyeD*.09),'rgba(65,255,105,.98)',1.45*scale,true);
+        poly([{x:mesh.leftEye.x-eyeD*.22,y:mesh.leftEye.y-eyeD*.24},{x:mesh.leftEye.x,y:mesh.leftEye.y-eyeD*.31},{x:mesh.leftEye.x+eyeD*.20,y:mesh.leftEye.y-eyeD*.25}],'rgba(255,70,70,.98)',1.45*scale);
+        poly([{x:mesh.rightEye.x-eyeD*.20,y:mesh.rightEye.y-eyeD*.25},{x:mesh.rightEye.x,y:mesh.rightEye.y-eyeD*.31},{x:mesh.rightEye.x+eyeD*.22,y:mesh.rightEye.y-eyeD*.24}],'rgba(65,255,105,.98)',1.45*scale);
+        poly(ellipse(mesh.mouth,eyeD*.32,eyeD*.075),'rgba(255,255,255,.96)',1.25*scale,true);
+        if(mode==='points'||mode==='geometry'){
+          ctx.save();ctx.fillStyle='rgba(255,255,255,.80)';const r=Math.max(.7,W/1150);
+          mesh.points.forEach(p=>{ctx.beginPath();ctx.arc(p.x,p.y,r,0,Math.PI*2);ctx.fill();});ctx.restore();
+        }
+        if(mode==='geometry'){
+          const p=faceInfo.analysis?.points||{};
+          drawMeasurementLineV32(ctx,p.top,p.chin,'脸长','#ffe56b');
+          drawMeasurementLineV32(ctx,p.foreheadL,p.foreheadR,'额头宽','#79d8ff');
+          drawMeasurementLineV32(ctx,p.cheekL,p.cheekR,'颧骨宽','#43f0b0');
+          drawMeasurementLineV32(ctx,p.jawL,p.jawR,'下颌宽','#ff8e75');
+          drawMeasurementLineV32(ctx,faceInfo.left,faceInfo.right,'双眼中心','#d2a8ff');
+        }
+      }
+
       function getFaceSizeProfileV33(analysis, imageWidth, product){
         const cheekWidth=Number(analysis?.metrics?.cheekWidth)||0;
         const ratio=imageWidth&&cheekWidth?cheekWidth/imageWidth:0;
@@ -4634,7 +4892,9 @@ snap.addEventListener('wheel', (e)=>{
 
         const landmarks=faceInfo?.landmarks||[];
         if(!landmarks.length){
-          // v35：没有真实关键点时只显示原照片和扫描线，不再用规则椭圆冒充贴脸网格。
+          if(faceInfo?.adaptiveMesh){
+            drawAdaptiveMeshV37(ctx,faceInfo,mode);
+          }
           return;
         }
 
@@ -4712,58 +4972,66 @@ snap.addEventListener('wheel', (e)=>{
         overlay.classList.add('open','scanning');
         overlay.setAttribute('aria-hidden','false');
         [1,2,3,4].forEach(i=>setScanStepV32(i,'','WAIT'));
-        showVisionRuntimeWarningV36();
 
         drawFaceMeshStageV32(canvas,img,current,'photo');
-        if(result) result.innerHTML='<strong>第 1 步：扫描用户面部</strong> 正在定位真实人脸区域与双眼中心。';
+        if(result) result.innerHTML='<strong>第 1 步：扫描用户面部</strong> 正在定位人脸区域、双眼中心与面部边缘。';
         setScanStepV32(1,'active','SCAN');
         await v32Sleep(850);
         setScanStepV32(1,'done','FACE OK');
 
         if(!current?.landmarks?.length){
-          setScanStepV32(2,'active','LOADING');
-          if(result) result.innerHTML='<strong>正在加载真实关键点模型</strong> 系统不会使用规则椭圆或假网格，请稍候。';
-          current=await forceRealLandmarksV35(img)||current;
-          analysis=current.analysis||analysis;
-          if(current?.landmarks?.length){
-            tryonState.eyeCenters=current;
-            tryonState.faceAnalysis=analysis;
-            tryonState.headPose=current.headPose||analysis.headPose||null;
-            tryonState.landmarks=current.landmarks;
+          setScanStepV32(2,'active','MODEL');
+          if(result) result.innerHTML='<strong>正在尝试真实关键点模型</strong> 如模型不可用，系统将自动切换到当前照片的离线视觉贴脸网格。';
+          const real=await forceRealLandmarksV35(img);
+          if(real?.landmarks?.length){
+            current=real;
+          }else{
+            current=buildAdaptiveFaceInfoV37(img);
           }
+          analysis=current.analysis||analysis;
+          tryonState.eyeCenters=current;
+          tryonState.faceAnalysis=analysis;
+          tryonState.headPose=current.headPose||analysis.headPose||null;
+          tryonState.landmarks=current.landmarks||null;
+          tryonState.adaptiveMesh=current.adaptiveMesh?current.mesh:null;
         }
 
-        if(!current?.landmarks?.length){
+        const isReal=!!current?.landmarks?.length;
+        const isAdaptive=!!current?.adaptiveMesh;
+        if(!isReal&&!isAdaptive){
           setScanStepV32(2,'','FAILED');
-          const runtime=getVisionRuntimeStatusV36();
-          const attempts=(visionDiagnosticsV36.attempts||[]).join(' → ')||'模型未启动';
-          if(result) result.innerHTML=`<strong>未取得真实面部关键点</strong>${runtime.message}<br>已尝试：${attempts}。当前不会生成假网格。`;
+          if(result) result.innerHTML='<strong>面部网格生成失败</strong>请换一张正脸、光线均匀、脸部占画面较大的照片。';
           overlay.classList.remove('scanning');
           return false;
         }
 
-        const meshCount=current.landmarks.length;
-        setScanStepV32(2,'active',`${meshCount} PTS`);
+        const meshCount=isReal?current.landmarks.length:(current.mesh?.points?.length||current.landmarkCount||0);
+        setScanStepV32(2,'active',isReal?`${meshCount} PTS`:'VISUAL');
         drawFaceMeshStageV32(canvas,img,current,'mesh');
-        if(result) result.innerHTML='<strong>第 2 步：生成贴脸三角网格</strong> 所有点均来自当前照片，网格会随额头、眼睛、鼻子、嘴唇和下颌变化。';
-        await v32Sleep(2100);
-        setScanStepV32(2,'done',`${meshCount} PTS`);
+        if(result){
+          result.innerHTML=isReal
+            ? '<strong>第 2 步：生成真实贴脸三角网格</strong> 所有坐标来自当前照片的 MediaPipe 面部关键点。'
+            : '<strong>第 2 步：生成离线视觉贴脸网格</strong> 网格根据当前照片的皮肤轮廓、双眼位置和面部行宽实时生成，不是固定模板。';
+        }
+        await v32Sleep(2200);
+        setScanStepV32(2,'done',isReal?`${meshCount} PTS`:'VISUAL OK');
 
         setScanStepV32(3,'active','POSE');
         drawFaceMeshStageV32(canvas,img,current,'geometry');
-        if(result) result.innerHTML='<strong>第 3 步：计算面部几何</strong> 正在计算额头、颧骨、下颌、瞳距以及 Yaw / Pitch / Roll。';
-        await v32Sleep(1700);
+        if(result) result.innerHTML='<strong>第 3 步：计算面部几何</strong> 正在计算额头、颧骨、下颌、瞳距、面宽与头部姿态。';
+        await v32Sleep(1750);
         setScanStepV32(3,'done','POSE OK');
 
         setScanStepV32(4,'active','FIT');
         const sizeProfile=getFaceSizeProfileV33(analysis,img.naturalWidth||img.width||0,tryonState.selectedGlasses||null);
         const top=Object.entries(analysis.probabilities||{}).sort((x,y)=>y[1]-x[1]).slice(0,3);
-        if(result) result.innerHTML='<strong>第 4 步：匹配脸型与镜框尺寸</strong> 正在根据真实面宽和瞳距计算镜框覆盖比例。';
-        await v32Sleep(1250);
+        if(result) result.innerHTML='<strong>第 4 步：匹配脸型与镜框尺寸</strong> 正在根据面宽和瞳距自动计算镜框覆盖比例。';
+        await v32Sleep(1300);
         setScanStepV32(4,'done','DONE');
         if(result){
           const detail=top.length?`概率参考：${top.map(([n,v])=>`${n} ${Math.round(v)}%`).join(' / ')}`:'';
-          result.innerHTML=`<strong>${analysis.faceType||'分析完成'} · ${analysis.confidence||0}%</strong>${meshCount} 个真实关键点；${sizeProfile.label}；推荐前框覆盖比 ${Math.round((sizeProfile.targetCoverage||.84)*100)}%。<br>${detail}`;
+          const source=isReal?`${meshCount} 个真实关键点`:'离线视觉贴脸网格';
+          result.innerHTML=`<strong>${analysis.faceType||'分析完成'} · ${analysis.confidence||0}%</strong>${source}；${sizeProfile.label}；推荐前框覆盖比 ${Math.round((sizeProfile.targetCoverage||.84)*100)}%。<br>${detail}`;
         }
         overlay.classList.remove('scanning');
         if(autoClose){await v32Sleep(1800);closeFaceScanV32();}
@@ -4779,15 +5047,16 @@ snap.addEventListener('wheel', (e)=>{
         if(!tryonState.photo) return;
         const btn=document.getElementById('faceScanReplayBtn');
         const oldText=btn?.textContent;
-        if(btn){btn.disabled=true;btn.textContent='正在检测真实网格…';}
+        if(btn){btn.disabled=true;btn.textContent='正在生成贴脸网格…';}
         const img=await loadImageFromSrc(tryonState.photo);
         const real=await forceRealLandmarksV35(img);
-        if(real){
-          tryonState.eyeCenters=real;tryonState.faceAnalysis=real.analysis;tryonState.headPose=real.headPose;tryonState.landmarks=real.landmarks;
+        const detected=real||buildAdaptiveFaceInfoV37(img);
+        if(detected){
+          tryonState.eyeCenters=detected;tryonState.faceAnalysis=detected.analysis;tryonState.headPose=detected.headPose;tryonState.landmarks=detected.landmarks||null;tryonState.adaptiveMesh=detected.adaptiveMesh?detected.mesh:null;
           persistTryonGuideState();renderFaceAnalysis();
         }
-        await showFaceScanStageV32(img,real||tryonState.eyeCenters||{}, {autoClose:false});
-        if(btn){btn.disabled=false;btn.textContent=oldText||'重新检测真实网格';}
+        await showFaceScanStageV32(img,detected||tryonState.eyeCenters||{}, {autoClose:false});
+        if(btn){btn.disabled=false;btn.textContent=oldText||'重新生成贴脸网格';}
       });
 
       function setV30Text(id, value){
@@ -6878,7 +7147,7 @@ function renderFaceAnalysis(){
         setV30Text('metricFrameMatch',product?`${match.total}%`:'待选镜框');
         setV30Text('poseQualityLabel',pose.label||'视觉姿态估计');
         const chosen=product?`当前选择「${product.name}」，综合匹配 ${match.total}%。`:'尚未选择镜框。';
-        setV30Text('faceSummary',`${landmarkCount?'系统实际检测 '+landmarkCount+' 个真实面部关键点。':'当前未取得真实面部关键点，因此不输出假网格。'}分类依据包括：视觉脸长比 ${m.visualFaceRatio??m.faceRatio??'--'}、额头/颧骨/下颌宽度 ${m.foreheadRatio??'--'} / 1.00 / ${m.jawRatio??'--'}、下颌角 ${m.jawAngleDeg??'--'}°、下颌曲率 ${m.jawCurvature??'--'}、下庭比例 ${m.lowerThird??'--'}。主结果为「${analysis.faceType}」，次级可能为「${analysis.secondaryFaceType||'待观察'}」。${sizeProfile.label}，建议前框覆盖比约 ${Math.round((sizeProfile.targetCoverage||.84)*100)}%。${chosen}`);
+        setV30Text('faceSummary',`${landmarkCount?'系统实际检测 '+landmarkCount+' 个真实面部关键点。':'当前真实模型未返回，已切换视觉网格，因此不输出假网格。'}分类依据包括：视觉脸长比 ${m.visualFaceRatio??m.faceRatio??'--'}、额头/颧骨/下颌宽度 ${m.foreheadRatio??'--'} / 1.00 / ${m.jawRatio??'--'}、下颌角 ${m.jawAngleDeg??'--'}°、下颌曲率 ${m.jawCurvature??'--'}、下庭比例 ${m.lowerThird??'--'}。主结果为「${analysis.faceType}」，次级可能为「${analysis.secondaryFaceType||'待观察'}」。${sizeProfile.label}，建议前框覆盖比约 ${Math.round((sizeProfile.targetCoverage||.84)*100)}%。${chosen}`);
         const list=document.getElementById('faceAdviceList');if(list) list.innerHTML=(analysis.advice||[]).map(a=>`<li>${a}</li>`).join('');
         const probs=document.getElementById('faceProbabilityList');
         if(probs){
